@@ -1,7 +1,10 @@
 /**
  * NovaLXP Training Compliance — Lambda Handler
  *
- * Runs on the 1st of every month (EventBridge Scheduler, 09:00 Europe/London).
+ * Triggered manually (schedule is DISABLED; re-enable via CloudFormation when ready).
+ * When DRY_RUN=true (default): generates and saves the compliance report to S3 only —
+ * no emails are sent and DynamoDB state is not updated.
+ * When DRY_RUN=false: additionally sends reminder emails and records state.
  *
  * Flow:
  *   1. Read + AI-parse the compliance policy PDF from S3 (Bedrock)
@@ -10,10 +13,9 @@
  *   4. Fetch historical TalentLMS completions (S3 snapshot)
  *   5. Fetch current NovaLXP completions (Moodle REST API)
  *   6. Build per-employee compliance status
- *   7. Load per-employee notification state from DynamoDB
- *   8. Send reminder emails via SES (new starter / upcoming / overdue)
- *   9. Update DynamoDB state
- *  10. Publish run summary to SNS
+ *   7. Generate HTML compliance report → save to S3 (always)
+ *   8. [DRY_RUN=false only] Load DynamoDB state, send emails, update state
+ *   9. Publish run summary to SNS (includes report URL)
  *
  * Networking: Lambda runs outside VPC — all external endpoints (BambooHR,
  * Moodle, SES, S3, Bedrock, DynamoDB, Secrets Manager) are reachable directly.
@@ -37,6 +39,7 @@ import {
 import { buildComplianceRecords, STATUS } from './compliance-engine.mjs';
 import { loadState, annotateWithSendDecision, recordEmailSent } from './state.mjs';
 import { sendComplianceEmail } from './emailer.mjs';
+import { generateAndSaveReport } from './report-generator.mjs';
 
 const sm = new SecretsManagerClient({ region: process.env.AWS_REGION || 'eu-west-2' });
 const sns = new SNSClient({ region: process.env.AWS_REGION || 'eu-west-2' });
@@ -54,6 +57,7 @@ export async function handler(event, context) {
     asOf: asOf.toISOString().slice(0, 10),
     dryRun: DRY_RUN,
     employees: 0,
+    reportUrl: null,
     emailsSent: { NEW_STARTER: 0, DUE_60_DAYS: 0, DUE_30_DAYS: 0, OVERDUE: 0 },
     skipped: 0,
     errors: [],
@@ -108,36 +112,46 @@ export async function handler(event, context) {
       asOf
     );
 
-    // ── Step 8: Load DynamoDB state ─────────────────────────────────────────
-    const emails = records.map(r => r.email);
-    const stateByEmail = await loadState(emails);
-    const annotated = annotateWithSendDecision(records, stateByEmail, asOf);
-
-    // ── Step 9: Send emails and update state ────────────────────────────────
-    const toSend = annotated.filter(r => r.shouldSendEmail);
-    console.log(`[main] ${toSend.length} employees need emails (of ${annotated.length} total)`);
-
-    for (const rec of toSend) {
-      try {
-        if (!DRY_RUN) {
-          await sendComplianceEmail(rec);
-          await recordEmailSent(rec);
-        } else {
-          console.log(`[dry-run] Would send ${rec.emailType} to ${rec.email} (${rec.name})`);
-        }
-        runStats.emailsSent[rec.emailType] = (runStats.emailsSent[rec.emailType] || 0) + 1;
-      } catch (e) {
-        const msg = `Failed to send ${rec.emailType} to ${rec.email}: ${e.message}`;
-        console.error('[main]', msg);
-        runStats.errors.push(msg);
-      }
+    // ── Step 8: Generate HTML compliance report → S3 (always, regardless of DRY_RUN) ──
+    try {
+      const { s3Key, presignedUrl } = await generateAndSaveReport(records, mappedCourses, policyRules, asOf);
+      runStats.reportUrl = presignedUrl;
+      console.log(`[main] Report saved: ${s3Key}`);
+    } catch (e) {
+      const msg = `Report generation failed: ${e.message}`;
+      console.error('[main]', msg);
+      runStats.errors.push(msg);
     }
 
-    runStats.skipped = annotated.filter(r => !r.shouldSendEmail && r.overallStatus !== STATUS.COMPLIANT).length;
-
-    // ── Step 10: Summary ────────────────────────────────────────────────────
+    // ── Step 9: Send emails and update state (skipped when DRY_RUN=true) ───
     const statusCounts = Object.values(STATUS).reduce((acc, s) => ({ ...acc, [s]: 0 }), {});
     for (const r of records) statusCounts[r.overallStatus]++;
+
+    if (!DRY_RUN) {
+      const emails = records.map(r => r.email);
+      const stateByEmail = await loadState(emails);
+      const annotated = annotateWithSendDecision(records, stateByEmail, asOf);
+      const toSend = annotated.filter(r => r.shouldSendEmail);
+      console.log(`[main] ${toSend.length} employees need emails`);
+
+      for (const rec of toSend) {
+        try {
+          await sendComplianceEmail(rec);
+          await recordEmailSent(rec);
+          runStats.emailsSent[rec.emailType] = (runStats.emailsSent[rec.emailType] || 0) + 1;
+        } catch (e) {
+          const msg = `Failed to send ${rec.emailType} to ${rec.email}: ${e.message}`;
+          console.error('[main]', msg);
+          runStats.errors.push(msg);
+        }
+      }
+
+      runStats.skipped = annotated.filter(r => !r.shouldSendEmail && r.overallStatus !== STATUS.COMPLIANT).length;
+    } else {
+      console.log('[main] DRY_RUN=true — email sending skipped');
+    }
+
+    // ── Step 10: Summary ────────────────────────────────────────────────────
 
     console.log('[main] Run complete:', JSON.stringify({ ...runStats, statusCounts }));
 
@@ -165,17 +179,12 @@ async function publishSummary(stats, statusCounts = {}, failed = false) {
 
   const totalEmails = Object.values(stats.emailsSent).reduce((n, c) => n + c, 0);
   const status = failed ? 'FAILED' : (stats.errors.length > 0 ? 'COMPLETED WITH ERRORS' : 'SUCCESS');
+  const mode = stats.dryRun ? ' [REPORT-ONLY MODE — no emails sent]' : '';
 
   const lines = [
-    `Compliance Run — ${stats.asOf} [${status}]${stats.dryRun ? ' [DRY RUN]' : ''}`,
+    `Compliance Run — ${stats.asOf} [${status}]${mode}`,
     '',
     `Employees assessed: ${stats.employees}`,
-    `Emails sent: ${totalEmails}`,
-    `  • New starter notices:  ${stats.emailsSent.NEW_STARTER || 0}`,
-    `  • 60-day reminders:     ${stats.emailsSent.DUE_60_DAYS || 0}`,
-    `  • 30-day reminders:     ${stats.emailsSent.DUE_30_DAYS || 0}`,
-    `  • Overdue notices:      ${stats.emailsSent.OVERDUE || 0}`,
-    `  • Skipped (already notified): ${stats.skipped}`,
     '',
     'Compliance status:',
     `  • Fully compliant:  ${statusCounts.COMPLIANT || 0}`,
@@ -184,6 +193,22 @@ async function publishSummary(stats, statusCounts = {}, failed = false) {
     `  • Due in 30 days:   ${statusCounts.DUE_30_DAYS || 0}`,
     `  • Overdue:          ${statusCounts.OVERDUE || 0}`,
   ];
+
+  if (stats.reportUrl) {
+    lines.push('', `Compliance report (valid 7 days):`, stats.reportUrl);
+  }
+
+  if (!stats.dryRun) {
+    lines.push(
+      '',
+      `Emails sent: ${totalEmails}`,
+      `  • New starter notices:  ${stats.emailsSent.NEW_STARTER || 0}`,
+      `  • 60-day reminders:     ${stats.emailsSent.DUE_60_DAYS || 0}`,
+      `  • 30-day reminders:     ${stats.emailsSent.DUE_30_DAYS || 0}`,
+      `  • Overdue notices:      ${stats.emailsSent.OVERDUE || 0}`,
+      `  • Skipped (already notified): ${stats.skipped}`,
+    );
+  }
 
   if (stats.warnings.length > 0) {
     lines.push('', 'Warnings:', ...stats.warnings.map(w => `  ! ${w}`));

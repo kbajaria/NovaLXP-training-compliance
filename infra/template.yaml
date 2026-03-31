@@ -61,11 +61,12 @@ Parameters:
 
   DryRun:
     Type: String
-    Default: 'false'
+    Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      When true, the Lambda logs what emails it would send but does not send
-      them and does not update DynamoDB state. Use for testing.
+      When true, no emails are sent and DynamoDB state is not updated. The
+      compliance report is still generated and saved to S3 regardless of this
+      setting. Set to false only when ready to enable live email sending.
 
 Resources:
 
@@ -169,12 +170,17 @@ Resources:
                 Resource:
                   - !Ref BambooHRSecret
                   - !Ref MoodleSecret
-              # S3: read policy PDF and TalentLMS historical export
+              # S3: read policy PDF and TalentLMS historical export; write compliance reports
               - Effect: Allow
                 Action: s3:GetObject
                 Resource:
                   - !Sub 'arn:aws:s3:::${PolicyBucket}/*'
                   - 'arn:aws:s3:::novalxp-talentlms-export-070017892219/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${PolicyBucket}/reports/*'
               # DynamoDB: read and write reminder state
               - Effect: Allow
                 Action:
@@ -233,6 +239,7 @@ Resources:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           TALENTLMS_S3_BUCKET: novalxp-talentlms-export-070017892219
           TALENTLMS_S3_PREFIX: talentlms-export-2026-03-29
+          REPORT_BUCKET: !Ref PolicyBucket
           DRY_RUN: !Ref DryRun
       Code:
         ZipFile: |
@@ -274,6 +281,7 @@ Resources:
     Properties:
       Name: !Sub '${ProjectName}-monthly'
       Description: Runs compliance check and sends reminder emails on the 1st of each month
+      State: DISABLED
       ScheduleExpression: !Ref ScheduleExpression
       ScheduleExpressionTimezone: !Ref ScheduleTimezone
       FlexibleTimeWindow:

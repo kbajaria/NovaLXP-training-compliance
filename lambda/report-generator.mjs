@@ -157,7 +157,7 @@ function buildHTML(records, requiredCourses, policyRules, asOf) {
       <td class="col-dept">${esc(emp.department)}</td>
       <td class="col-loc">${esc(emp.location)}</td>
       <td class="col-title">${esc(emp.jobTitle)}</td>
-      ${statusPill(emp).replace('<span', '<td style="padding:5px 6px">').replace('</span>', '</td>')}
+      <td style="padding:5px 6px">${statusPill(emp)}</td>
       ${courseCells}
     </tr>`);
   }

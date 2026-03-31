@@ -1,0 +1,7 @@
+node_modules/
+.build/
+*.zip
+.env
+*.pdf
+!policy/*.md
+.DS_Store

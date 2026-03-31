@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NovaLXP Training Compliance — monthly compliance checker and email reminder
+  system. Determines which Finova employees are non-compliant with mandatory
+  annual training (or are new starters / approaching renewal) and sends
+  targeted reminder emails via SES. Runs on the 1st of each month.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: novalxp-training-compliance
+    AllowedPattern: '^[a-z0-9-]{3,64}$'
+    Description: Prefix for all named resources.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 9 1 * ? *)
+    Description: EventBridge schedule expression (default — 09:00 on 1st of each month).
+
+  ScheduleTimezone:
+    Type: String
+    Default: Europe/London
+    Description: IANA timezone for the EventBridge schedule.
+
+  MoodleBaseUrl:
+    Type: String
+    Default: https://learn.novalxp.co.uk
+    Description: NovaLXP Moodle base URL.
+
+  SesFromEmail:
+    Type: String
+    Default: learning@finova.tech
+    Description: >-
+      Verified SES sender address. The sending domain (finova.tech) must have
+      SES DKIM/domain verification configured and the account must be out of
+      SES sandbox mode to send to arbitrary recipients.
+
+  AlertEmail:
+    Type: String
+    Description: Email address for monthly run summaries and error alerts.
+
+  BedrockModelId:
+    Type: String
+    Default: eu.anthropic.claude-haiku-4-5-20251001
+    Description: Bedrock model ID used to parse the policy PDF.
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    MaxValue: 3008
+    Description: Lambda memory allocation in MB.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda timeout in seconds (max 900 for data-intensive Moodle API calls).
+
+  DryRun:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, the Lambda logs what emails it would send but does not send
+      them and does not update DynamoDB state. Use for testing.
+
+Resources:
+
+  # ── S3: Policy document bucket ────────────────────────────────────────────
+
+  PolicyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-policy-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: keep-old-policy-versions-1year
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+
+  # ── DynamoDB: Reminder state table ────────────────────────────────────────
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-state'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  # ── Secrets Manager ────────────────────────────────────────────────────────
+
+  BambooHRSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/bamboohr'
+      Description: BambooHR API credentials for compliance checker
+      SecretString: !Sub |
+        {
+          "BAMBOOHR_API_KEY": "REPLACE_ME",
+          "BAMBOOHR_COMPANY_DOMAIN": "finova"
+        }
+
+  MoodleSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/moodle'
+      Description: NovaLXP Moodle web service token for compliance checker
+      SecretString: !Sub |
+        {
+          "MOODLE_TOKEN": "REPLACE_ME"
+        }
+
+  # ── SNS: Alert topic ──────────────────────────────────────────────────────
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── IAM: Lambda execution role ────────────────────────────────────────────
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: compliance-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Secrets Manager: read BambooHR and Moodle credentials
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BambooHRSecret
+                  - !Ref MoodleSecret
+              # S3: read policy PDF and TalentLMS historical export
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${PolicyBucket}/*'
+                  - 'arn:aws:s3:::novalxp-talentlms-export-070017892219/*'
+              # DynamoDB: read and write reminder state
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:BatchGetItem
+                Resource: !GetAtt StateTable.Arn
+              # SES: send emails
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ses:FromAddress': !Ref SesFromEmail
+              # SNS: publish run summaries
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              # Bedrock: invoke model to parse policy PDF
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-haiku*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/eu.anthropic.claude-haiku*'
+
+  # ── Lambda: Compliance checker ────────────────────────────────────────────
+
+  ComplianceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}'
+      Description: Monthly compliance training checker and reminder emailer
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: !Ref LambdaTimeoutSeconds
+      # No VpcConfig — Lambda runs outside VPC for direct internet egress.
+      # All required endpoints (BambooHR, Moodle, SES, S3, Bedrock, DynamoDB)
+      # are reachable from Lambda without VPC. This matches the established
+      # pattern used by all other NovaLXP Lambda functions.
+      Environment:
+        Variables:
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+          BAMBOOHR_SECRET_ID: !Ref BambooHRSecret
+          MOODLE_SECRET_ID: !Ref MoodleSecret
+          MOODLE_BASE_URL: !Ref MoodleBaseUrl
+          POLICY_BUCKET: !Ref PolicyBucket
+          POLICY_KEY: policy/mandatory-training-policy.pdf
+          STATE_TABLE: !Ref StateTable
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          SES_FROM_EMAIL: !Ref SesFromEmail
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          TALENTLMS_S3_BUCKET: novalxp-talentlms-export-070017892219
+          TALENTLMS_S3_PREFIX: talentlms-export-2026-03-29
+          DRY_RUN: !Ref DryRun
+      Code:
+        ZipFile: |
+          export const handler = async () => ({ statusCode: 200, body: 'placeholder' });
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+
+  ComplianceFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ComplianceFunction}'
+      RetentionInDays: 90
+
+  # ── EventBridge Scheduler ─────────────────────────────────────────────────
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-compliance-lambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ComplianceFunction.Arn
+
+  MonthlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-monthly'
+      Description: Runs compliance check and sends reminder emails on the 1st of each month
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ComplianceFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 1
+          MaximumEventAgeInSeconds: 3600
+
+Outputs:
+
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref ComplianceFunction
+
+  PolicyBucketName:
+    Description: S3 bucket where the policy PDF must be uploaded
+    Value: !Ref PolicyBucket
+
+  StateTableName:
+    Description: DynamoDB table for reminder state
+    Value: !Ref StateTable
+
+  BambooHRSecretArn:
+    Description: Secrets Manager ARN — update with real BambooHR API key
+    Value: !Ref BambooHRSecret
+
+  MoodleSecretArn:
+    Description: Secrets Manager ARN — update with real Moodle token
+    Value: !Ref MoodleSecret
+
+  ScheduleName:
+    Description: EventBridge Scheduler schedule name
+    Value: !Ref MonthlySchedule

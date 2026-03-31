@@ -1,0 +1,17 @@
+{
+  "name": "novalxp-training-compliance",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Automated mandatory training compliance checker and reminder mailer for Finova",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-ses": "^3.0.0",
+    "@aws-sdk/client-sns": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "xml2js": "^0.6.2"
+  }
+}

@@ -42,7 +42,7 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    Default: eu.anthropic.claude-haiku-4-5-20251001
+    Default: eu.amazon.nova-micro-v1:0
     Description: Bedrock model ID used to parse the policy PDF.
 
   LambdaMemoryMB:

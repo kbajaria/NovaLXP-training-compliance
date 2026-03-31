@@ -9,8 +9,7 @@
  * for the Lambda context (no PDF rendering, HTML saved to S3).
  */
 
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const s3 = new S3Client({ region: process.env.AWS_REGION || 'eu-west-2' });
 const REPORT_BUCKET = process.env.REPORT_BUCKET;
@@ -39,7 +38,7 @@ const STATUS_ORDER = {
  * @param {string[]} requiredCourses — course keys that were checked
  * @param {Object} policyRules — { newStarterGraceDays, renewalMonths, reminderDays }
  * @param {Date} asOf — report date
- * @returns {{ s3Key: string, presignedUrl: string }} — S3 key and 7-day presigned URL
+ * @returns {{ s3Key: string, s3Uri: string }} — S3 key and full s3:// URI
  */
 export async function generateAndSaveReport(records, requiredCourses, policyRules, asOf) {
   const html = buildHTML(records, requiredCourses, policyRules, asOf);
@@ -54,16 +53,10 @@ export async function generateAndSaveReport(records, requiredCourses, policyRule
     Metadata: { 'report-date': isoDate, 'employee-count': String(records.length) },
   }));
 
-  console.log(`[report] Saved to s3://${REPORT_BUCKET}/${s3Key}`);
+  const s3Uri = `s3://${REPORT_BUCKET}/${s3Key}`;
+  console.log(`[report] Saved to ${s3Uri}`);
 
-  // Generate a 7-day presigned URL for direct browser access
-  const presignedUrl = await getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: REPORT_BUCKET, Key: s3Key }),
-    { expiresIn: 7 * 24 * 3600 }
-  );
-
-  return { s3Key, presignedUrl };
+  return { s3Key, s3Uri };
 }
 
 // ─── HTML builder ─────────────────────────────────────────────────────────────

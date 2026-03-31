@@ -114,8 +114,8 @@ export async function handler(event, context) {
 
     // ── Step 8: Generate HTML compliance report → S3 (always, regardless of DRY_RUN) ──
     try {
-      const { s3Key, presignedUrl } = await generateAndSaveReport(records, mappedCourses, policyRules, asOf);
-      runStats.reportUrl = presignedUrl;
+      const { s3Key, s3Uri } = await generateAndSaveReport(records, mappedCourses, policyRules, asOf);
+      runStats.reportUrl = s3Uri;
       console.log(`[main] Report saved: ${s3Key}`);
     } catch (e) {
       const msg = `Report generation failed: ${e.message}`;
@@ -195,7 +195,15 @@ async function publishSummary(stats, statusCounts = {}, failed = false) {
   ];
 
   if (stats.reportUrl) {
-    lines.push('', `Compliance report (valid 7 days):`, stats.reportUrl);
+    const filename = stats.reportUrl.split('/').pop();
+    lines.push(
+      '',
+      'Compliance report:',
+      stats.reportUrl,
+      '',
+      'Download:',
+      `aws s3 cp ${stats.reportUrl} ~/Desktop/${filename}`,
+    );
   }
 
   if (!stats.dryRun) {

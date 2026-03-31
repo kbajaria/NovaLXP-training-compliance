@@ -71,8 +71,8 @@ export async function handler(event, context) {
       getSecret(BAMBOOHR_SECRET),
       getSecret(MOODLE_SECRET),
     ]);
-    const bambooApiKey = bambooSecrets.BAMBOOHR_API_KEY;
-    const moodleToken  = moodleSecrets.MOODLE_TOKEN;
+    const bambooApiKey = bambooSecrets.BAMBOOHR_API_KEY || bambooSecrets.bamboohr_api_key;
+    const moodleToken  = moodleSecrets.MOODLE_TOKEN    || moodleSecrets.moodle_token;
 
     // ── Step 2: Parse policy PDF ────────────────────────────────────────────
     const policyRules = await parsePolicyPDF();

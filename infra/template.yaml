@@ -199,15 +199,14 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref AlertTopic
-              # Bedrock: invoke model to parse policy PDF
+              # Bedrock: invoke model to parse policy PDF.
+              # Cross-region inference profiles (eu.*) route across multiple EU regions at runtime,
+              # so the resource must be a wildcard — the actual region called is not predictable.
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:Converse
-                Resource:
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-haiku*'
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/eu.anthropic.claude-haiku*'
+                Resource: '*'
 
   # ── Lambda: Compliance checker ────────────────────────────────────────────
 

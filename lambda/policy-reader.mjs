@@ -31,18 +31,41 @@ const BEDROCK_MODEL = process.env.BEDROCK_MODEL_ID || 'eu.anthropic.claude-haiku
  * }
  */
 
+// Fallback rules used when Bedrock is unavailable (access not yet enabled, etc.).
+// These reflect policy/finova-mandatory-training-policy.md v1.0.
+// Keep in sync with the policy document — these are used if AI parsing fails.
+const FALLBACK_RULES = {
+  newStarterGraceDays: 90,
+  renewalMonths: 12,
+  reminderDays: [60, 30],
+  requiredCourses: [
+    'Bribery Prevention',
+    'Data Protection',
+    'DSE (Display Screen Equipment)',
+    'Fraud Prevention',
+    'Information Security',
+    'Responsible Use of Social Media',
+  ],
+};
+
 export async function parsePolicyPDF() {
   console.log(`[policy] Reading policy from s3://${POLICY_BUCKET}/${POLICY_KEY}`);
 
-  // Fetch PDF bytes from S3
+  // Fetch policy file from S3 (supports PDF and plain text/markdown)
   const resp = await s3.send(new GetObjectCommand({ Bucket: POLICY_BUCKET, Key: POLICY_KEY }));
   const chunks = [];
   for await (const chunk of resp.Body) chunks.push(chunk);
-  const pdfBytes = Buffer.concat(chunks);
-  console.log(`[policy] PDF loaded (${pdfBytes.length} bytes)`);
+  const fileBytes = Buffer.concat(chunks);
+  console.log(`[policy] Policy file loaded (${fileBytes.length} bytes, key: ${POLICY_KEY})`);
 
-  // Ask Claude to extract the compliance rules
-  const prompt = `You are reading a corporate mandatory training compliance policy document.
+  // Detect whether the file is plain text (markdown/txt) or binary (PDF).
+  // Strategy: attempt UTF-8 decode; if it succeeds and contains readable text, treat as text.
+  const ext = POLICY_KEY.split('.').pop().toLowerCase();
+  const isText = ext === 'md' || ext === 'txt' || (ext !== 'pdf' && isLikelyText(fileBytes));
+  const fileText = isText ? fileBytes.toString('utf8') : null;
+  if (isText) console.log('[policy] Detected plain text/markdown — sending as text to Bedrock');
+
+  const extractionPrompt = `You are reading a corporate mandatory training compliance policy document.
 Extract the following information and return it as a JSON object with exactly these keys:
 - "newStarterGraceDays": integer — the number of days new starters have to complete mandatory training after joining
 - "renewalMonths": integer — how often employees must recertify (in months, e.g., 12 for annual)
@@ -52,37 +75,42 @@ Extract the following information and return it as a JSON object with exactly th
 Return ONLY valid JSON, no prose, no markdown, no code fences. Example:
 {"newStarterGraceDays":90,"renewalMonths":12,"reminderDays":[60,30],"requiredCourses":["Bribery Prevention","Data Protection"]}`;
 
-  const result = await bedrock.send(new ConverseCommand({
-    modelId: BEDROCK_MODEL,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            document: {
-              name: 'mandatory-training-policy',
-              format: 'pdf',
-              source: { bytes: pdfBytes },
-            },
+  const messageContent = isText
+    ? [{ text: `${fileText}\n\n---\n\n${extractionPrompt}` }]
+    : [
+        {
+          document: {
+            name: 'mandatory-training-policy',
+            format: 'pdf',
+            source: { bytes: fileBytes },
           },
-          { text: prompt },
-        ],
-      },
-    ],
-    inferenceConfig: { maxTokens: 512, temperature: 0 },
-  }));
-
-  const raw = result.output?.message?.content?.find(b => b.text)?.text?.trim() || '';
-  console.log('[policy] Bedrock response:', raw.slice(0, 400));
+        },
+        { text: extractionPrompt },
+      ];
 
   let rules;
   try {
-    rules = JSON.parse(raw);
-  } catch {
-    // If Claude wrapped the JSON in markdown fences, strip them
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error(`Could not parse policy rules from Bedrock response: ${raw.slice(0, 200)}`);
-    rules = JSON.parse(match[0]);
+    const result = await bedrock.send(new ConverseCommand({
+      modelId: BEDROCK_MODEL,
+      messages: [{ role: 'user', content: messageContent }],
+      inferenceConfig: { maxTokens: 512, temperature: 0 },
+    }));
+
+    const raw = result.output?.message?.content?.find(b => b.text)?.text?.trim() || '';
+    console.log('[policy] Bedrock response:', raw.slice(0, 400));
+
+    try {
+      rules = JSON.parse(raw);
+    } catch {
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error(`Could not parse Bedrock response: ${raw.slice(0, 200)}`);
+      rules = JSON.parse(match[0]);
+    }
+  } catch (bedrockErr) {
+    // Bedrock unavailable (model access not yet enabled, access denied, etc.)
+    // Fall back to the hardcoded rules from policy v1.0 and continue the run.
+    console.warn(`[policy] Bedrock unavailable (${bedrockErr.message.slice(0, 120)}) — using fallback rules from FALLBACK_RULES`);
+    return FALLBACK_RULES;
   }
 
   // Validate required fields
@@ -98,4 +126,17 @@ Return ONLY valid JSON, no prose, no markdown, no code fences. Example:
 
   console.log(`[policy] Rules extracted: grace=${newStarterGraceDays}d, renewal=${renewalMonths}mo, reminders=[${reminderDays.join(',')}]d, courses=${requiredCourses.length}`);
   return rules;
+}
+
+// Returns true if the buffer looks like UTF-8 text (not binary/PDF)
+function isLikelyText(buf) {
+  // PDFs start with %PDF
+  if (buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return false;
+  // Sample first 512 bytes — if they decode cleanly as UTF-8 text, treat as text
+  try {
+    const sample = buf.slice(0, 512).toString('utf8');
+    return /^[\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]*$/.test(sample);
+  } catch {
+    return false;
+  }
 }

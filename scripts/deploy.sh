@@ -45,12 +45,12 @@ echo "[build] Cleaning build directory..."
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
-echo "[build] Installing dependencies..."
-(cd "${LAMBDA_DIR}" && npm install --omit=dev --prefix "${BUILD_DIR}" 2>&1 | tail -5)
-
 echo "[build] Copying function source..."
 cp "${LAMBDA_DIR}"/*.mjs "${BUILD_DIR}/"
 cp "${LAMBDA_DIR}/package.json" "${BUILD_DIR}/"
+
+echo "[build] Installing dependencies..."
+(cd "${BUILD_DIR}" && npm install --omit=dev 2>&1 | tail -5)
 
 echo "[build] Creating deployment package..."
 (cd "${BUILD_DIR}" && zip -qr "${ZIP_FILE}" .)

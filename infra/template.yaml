@@ -42,7 +42,7 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    Default: eu.amazon.nova-micro-v1:0
+    Default: eu.anthropic.claude-haiku-4-5-20251001-v1:0
     Description: Bedrock model ID used to parse the policy PDF.
 
   LambdaMemoryMB:
@@ -202,10 +202,14 @@ Resources:
               # Bedrock: invoke model to parse policy PDF.
               # Cross-region inference profiles (eu.*) route across multiple EU regions at runtime,
               # so the resource must be a wildcard — the actual region called is not predictable.
+              # aws-marketplace permissions are required for Anthropic models (distributed via
+              # AWS Marketplace); without them Bedrock returns an access denied error at invocation.
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:Converse
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
                 Resource: '*'
 
   # ── Lambda: Compliance checker ────────────────────────────────────────────

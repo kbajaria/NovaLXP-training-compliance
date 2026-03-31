@@ -61,7 +61,7 @@ export async function parsePolicyPDF() {
   // Detect whether the file is plain text (markdown/txt) or binary (PDF).
   // Strategy: attempt UTF-8 decode; if it succeeds and contains readable text, treat as text.
   const ext = POLICY_KEY.split('.').pop().toLowerCase();
-  const isText = ext === 'md' || ext === 'txt' || (ext !== 'pdf' && isLikelyText(fileBytes));
+  const isText = ext === 'md' || ext === 'txt' || isLikelyText(fileBytes);
   const fileText = isText ? fileBytes.toString('utf8') : null;
   if (isText) console.log('[policy] Detected plain text/markdown — sending as text to Bedrock');
 
